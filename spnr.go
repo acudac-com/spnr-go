@@ -11,14 +11,14 @@ import (
 	"google.golang.org/grpc/codes"
 )
 
-// Interface satisfied by ReadOnly and ReadWrite transactions.
+// Interface satisfied by a ReadOnly and ReadWrite transactions.
 type ReadTxn interface {
 	ReadRow(ctx context.Context, table string, key spanner.Key, columns []string) (*spanner.Row, error)
 	Read(ctx context.Context, table string, keys spanner.KeySet, columns []string) *spanner.RowIterator
 	Query(ctx context.Context, statement spanner.Statement) *spanner.RowIterator
 }
 
-// Interface satisfied by spanner's ReadWrite transaction.
+// Interface satisfied by a ReadWrite transaction.
 type WriteTxn interface {
 	BufferWrite(ms []*spanner.Mutation) error
 }
@@ -29,11 +29,10 @@ type Db struct {
 	SpannerCli *spanner.Client
 }
 
-// Returns a new database instance, containing a client connection using spanner's database roles.
-// The connection is also setup to only retry spanner transactions if "Unavailable" is returned.
-//   - database: The full name of the spanner database in the format 'projects/*/instances/*/databases/*'
+// Returns a database client that only retries transactions if "Unavailable" is returned.
+//   - database: The full name of the database in the format 'projects/*/instances/*/databases/*'
 //   - role: The database role to use for fine grained database access.
-func NewDb(database, role string) *Db {
+func NewDbClient(database, role string) *Db {
 	ctx := context.Background()
 	co := &spapi.CallOptions{
 		ExecuteSql: []gax.CallOption{
@@ -55,5 +54,22 @@ func NewDb(database, role string) *Db {
 	return &Db{
 		Name:       database,
 		SpannerCli: spannerCli,
+	}
+}
+
+// A table.
+type Table[T any] struct {
+	rowConverter func(r *spanner.Row) (T, error)
+	Db           *Db
+}
+
+// Returns a table client.
+//   - db: A database client created with spnr.NewDbClient
+//   - table: The table name
+//   - rowConverter: A function that takes in a spanner row and returns the generic type of this client
+func NewTableClient[T any](db *Db, table string, rowConverter func(r *spanner.Row) (T, error)) *Table[T] {
+	return &Table[T]{
+		rowConverter: rowConverter,
+		Db:           db,
 	}
 }
