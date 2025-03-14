@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -32,10 +33,10 @@ type Db struct {
 }
 
 // Returns a database client that only retries transactions if "Unavailable" is returned.
+//   - ctx: The context
 //   - database: The full name of the database in the format 'projects/*/instances/*/databases/*'
 //   - role: The database role to use for fine grained database access.
-func NewDbClient(database, role string) (*Db, error) {
-	ctx := context.Background()
+func NewDbClient(ctx context.Context, database, role string) (*Db, error) {
 	co := &spapi.CallOptions{
 		ExecuteSql: []gax.CallOption{
 			gax.WithRetry(func() gax.Retryer {
@@ -60,26 +61,45 @@ func NewDbClient(database, role string) (*Db, error) {
 }
 
 // A table.
-type Table[RowT *any, KeyT any] struct {
-	db           *Db
-	name         string
-	columns      []string
-	rowConverter func(r *spanner.Row) (RowT, error)
-	keyConverter func(KeyT) (spanner.Key, error)
+type Table[RowT any, KeyT any] struct {
+	db             *Db
+	name           string
+	colSet         map[string]bool
+	readConverter  func(r *spanner.Row) (*RowT, error)
+	writeConverter func(row *RowT) (map[string]any, error)
+	keyConverter   func(key KeyT) spanner.Key
 }
 
 // Returns a table client.
 //   - db: A database client created with spnr.NewDbClient
 //   - table: The table name
+//   - columns: All the columns in the table including the key(s)
 //   - rowConverter: A function that takes in a spanner row and returns the generic type of this client
-func NewTableClient[RowT *any, KeyT any](db *Db, table string, columns []string, rowConverter func(r *spanner.Row) (RowT, error), keyConverter func(key KeyT) (spanner.Key, error)) *Table[RowT, KeyT] {
-	return &Table[RowT, KeyT]{
-		db:           db,
-		name:         table,
-		columns:      columns,
-		rowConverter: rowConverter,
-		keyConverter: keyConverter,
+func NewTableClient[RowT any, KeyT any](db *Db, table string, columns []string, keyConverter func(key KeyT) spanner.Key, readConverter func(r *spanner.Row) (*RowT, error), writeConverter func(row *RowT) (map[string]any, error)) (*Table[RowT, KeyT], error) {
+	if db == nil {
+		return nil, errors.New("db is nil")
 	}
+	if table == "" {
+		return nil, errors.New("invalid table name")
+	}
+	if len(columns) == 0 {
+		return nil, errors.New("columns not specified")
+	}
+	if readConverter == nil {
+		return nil, errors.New("rowConverter not specified")
+	}
+	colSet := map[string]bool{}
+	for _, col := range columns {
+		colSet[col] = true
+	}
+	return &Table[RowT, KeyT]{
+		db:             db,
+		name:           table,
+		colSet:         colSet,
+		keyConverter:   keyConverter,
+		readConverter:  readConverter,
+		writeConverter: writeConverter,
+	}, nil
 }
 
 // Apply one/more row mutations on a Db.
@@ -97,23 +117,22 @@ func (d *Db) Mutate(ctx context.Context, txn WriteTxn, mutations ...*spanner.Mut
 }
 
 // Reads the specified row.
-// If no txn given, one is created which is closed after returning the result.
-func (t *Table[RowT, KeyT]) Read(ctx context.Context, txn ReadTxn, key KeyT, cols ...string) (RowT, error) {
+// If no txn given, a ReadOnly txn is created. Its closed after returning the result.
+// If cols not specified, all columns are read.
+func (t *Table[RowT, KeyT]) Read(ctx context.Context, txn ReadTxn, key KeyT, cols ...string) (*RowT, error) {
 	if txn == nil {
 		tempTxn := t.db.Client.ReadOnlyTransaction()
 		defer tempTxn.Close()
 		txn = tempTxn
 	}
 
-	spannerKey, err := t.keyConverter(key)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to construct spanner key from %v: %v", key, err)
-	}
 	if len(cols) == 0 {
-		cols = t.columns
+		for col := range t.colSet {
+			cols = append(cols, col)
+		}
 	}
 
-	row, err := txn.ReadRow(ctx, t.name, spannerKey, cols)
+	row, err := txn.ReadRow(ctx, t.name, t.keyConverter(key), cols)
 	if err != nil {
 		if errors.Is(err, spanner.ErrRowNotFound) {
 			return nil, status.Errorf(codes.NotFound, "%v not found", key)
@@ -121,30 +140,28 @@ func (t *Table[RowT, KeyT]) Read(ctx context.Context, txn ReadTxn, key KeyT, col
 			return nil, status.Errorf(codes.Internal, "reading spanner row: %v", err)
 		}
 	}
-	return t.rowConverter(row)
+	return t.readConverter(row)
 }
 
-// Reads the specified rows.
-// If no txn given, one is created which is closed after returning the result.
-func (t *Table[RowT, KeyT]) BatchRead(ctx context.Context, txn ReadTxn, keys []KeyT, cols ...string) ([]RowT, error) {
+// Reads the specified rows. Does not fail if a row is not found.
+// If no txn given, a ReadOnly txn is created. Its closed after returning the result.
+// If cols not specified, all columns are read.
+func (t *Table[RowT, KeyT]) BatchRead(ctx context.Context, txn ReadTxn, keys []KeyT, cols ...string) ([]*RowT, error) {
 	if txn == nil {
 		tempTxn := t.db.Client.ReadOnlyTransaction()
 		defer tempTxn.Close()
 		txn = tempTxn
 	}
 
-	spannerKeys := []spanner.Key{}
-	for _, key := range keys {
-		spannerKey, err := t.keyConverter(key)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to construct spanner key from %v: %v", key, err)
+	if len(cols) == 0 {
+		for col := range t.colSet {
+			cols = append(cols, col)
 		}
-		spannerKeys = append(spannerKeys, spannerKey)
 	}
 
-	rows := []RowT{}
+	rows := []*RowT{}
 	do := func(r *spanner.Row) error {
-		row, err := t.rowConverter(r)
+		row, err := t.readConverter(r)
 		if err != nil {
 			return err
 		}
@@ -152,9 +169,215 @@ func (t *Table[RowT, KeyT]) BatchRead(ctx context.Context, txn ReadTxn, keys []K
 		return nil
 	}
 
+	spannerKeys := []spanner.Key{}
+	for _, key := range keys {
+		spannerKeys = append(spannerKeys, t.keyConverter(key))
+	}
+
 	it := txn.Read(ctx, t.name, spanner.KeySetFromKeys(spannerKeys...), cols)
 	if err := it.Do(do); err != nil {
 		return nil, err
+	}
+	return rows, nil
+}
+
+// Creates a new row.
+//   - ctx: context
+//   - txn: optional spanner ReadWrite txn; if none given, one is created and also closed after the create
+//   - row: the new row's data
+func (t *Table[RowT, KeyT]) Create(ctx context.Context, txn WriteTxn, row *RowT) error {
+	// convert row to map and validate
+	m, err := t.writeConverter(row)
+	if err != nil {
+		return err
+	}
+	for col := range m {
+		if _, ok := t.colSet[col]; !ok {
+			return status.Errorf(codes.Internal, "writeConverter returned %s, which is not a valid column in %s", col, t.name)
+		}
+	}
+
+	// build up cols and values
+	columns := []string{}
+	values := []any{}
+	for col, val := range m {
+		columns = append(columns, col)
+		values = append(values, val)
+	}
+
+	// run insert mutation
+	insertMutation := spanner.Insert(t.name, columns, values)
+	if err := t.db.Mutate(ctx, txn, insertMutation); err != nil {
+		return status.Errorf(codes.Internal, "creating spanner row: %v", err)
+	}
+	return nil
+}
+
+// Update an existing row.
+//   - ctx: context
+//   - txn: optional spanner ReadWrite txn; if none given, one is created and also closed after the update
+//   - row: the existing row's data
+//   - cols: optional list of columns to limit the update to.
+func (t *Table[RowT, KeyT]) Update(ctx context.Context, txn WriteTxn, row *RowT, cols ...string) error {
+	// validate cols if any and build map
+	colSet := map[string]bool{}
+	if len(cols) > 0 {
+		for _, col := range cols {
+			if _, ok := t.colSet[col]; !ok {
+				return status.Errorf(codes.Internal, "update: %s is not a valid column to limit update to in %s", col, t.name)
+			}
+			colSet[col] = true
+		}
+	} else {
+		colSet = t.colSet
+	}
+
+	// convert row to map
+	m, err := t.writeConverter(row)
+	if err != nil {
+		return err
+	}
+	for col := range m {
+		if _, ok := t.colSet[col]; !ok {
+			return status.Errorf(codes.Internal, "writeConverter returned %s, which is not a valid column in %s", col, t.name)
+		}
+	}
+
+	// build up cols and values
+	columns := []string{}
+	values := []any{}
+	for col, value := range m {
+		if _, ok := colSet[col]; ok {
+			columns = append(columns, col)
+			values = append(values, value)
+		}
+	}
+
+	// run update mutation
+	updateMutation := spanner.Update(t.name, columns, values)
+	if err := t.db.Mutate(ctx, txn, updateMutation); err != nil {
+		return status.Errorf(codes.Internal, "updating spanner row: %v", err)
+	}
+	return nil
+}
+
+// Delete the row at the given key.
+// Creates a new ReadWrite transaction if none given.
+func (t *Table[RowT, KeyT]) Delete(ctx context.Context, txn WriteTxn, key KeyT) error {
+	spannerKey := t.keyConverter(key)
+	deleteMutation := spanner.Delete(t.name, spanner.KeySetFromKeys(spannerKey))
+	if err := t.db.Mutate(ctx, txn, deleteMutation); err != nil {
+		return status.Errorf(codes.Internal, "deleting spanner rows: %v", err)
+	}
+	return nil
+}
+
+// Delete the rows at the given keys.
+// Creates a new ReadWrite transaction if none given.
+func (t *Table[RowT, KeyT]) BatchDelete(ctx context.Context, txn WriteTxn, keys ...KeyT) error {
+	if len(keys) == 0 {
+		return status.Errorf(codes.Internal, "no keys specified in BatchDelete")
+	}
+
+	spannerKeys := []spanner.Key{}
+	for _, key := range keys {
+		spannerKeys = append(spannerKeys, t.keyConverter(key))
+	}
+
+	deleteMutation := spanner.Delete(t.name, spanner.KeySetFromKeys(spannerKeys...))
+	if err := t.db.Mutate(ctx, txn, deleteMutation); err != nil {
+		return status.Errorf(codes.Internal, "deleting spanner rows: %v", err)
+	}
+	return nil
+}
+
+// A column to sort on
+type SortedColumn struct {
+	Col        string
+	Descending bool
+}
+
+type QueryOpts struct {
+	// The columns to select
+	Cols []string
+	// The sorting to apply
+	SortCols []*SortedColumn
+	// The max number of rows to return
+	Limit int32
+	// Start after these nr of rows; useful for pagination
+	Offset int64
+	// A filter to apply; preceeded by "WHERE" keyword
+	Where string
+}
+
+// Queries the rows in the table using the parameters specifed in opts.
+// Creates a new ReadOnly txn if none given.
+func (t *Table[RowT, KeyT]) Query(ctx context.Context, txn ReadTxn, opts *QueryOpts) ([]*RowT, error) {
+	if opts == nil {
+		opts = &QueryOpts{}
+	}
+
+	// create txn if none given
+	if txn == nil {
+		t := t.db.Client.ReadOnlyTransaction()
+		defer t.Close()
+		txn = t
+	}
+
+	// Initialize query
+	query := fmt.Sprintf("SELECT * FROM %s", t.name)
+	if len(opts.Cols) > 0 {
+		wrappedColNames := []string{}
+		for _, col := range opts.Cols {
+			wrappedColNames = append(wrappedColNames, fmt.Sprintf("`%s`", col))
+		}
+		query = fmt.Sprintf("SELECT %s FROM %s", strings.Join(wrappedColNames, ","), t.name)
+	}
+
+	// Add where clause if provided
+	if opts.Where != "" {
+		query += " WHERE " + opts.Where
+	}
+
+	// Add sort cols if provided
+	if len(opts.SortCols) > 0 {
+		query += " ORDER BY "
+		sortColumns := make([]string, 0, len(opts.SortCols))
+		for _, sortedCol := range opts.SortCols {
+			order := "ASC"
+			if sortedCol.Descending {
+				order = "DESC"
+			}
+			sortColumns = append(sortColumns, fmt.Sprintf("%s %s", sortedCol.Col, order))
+		}
+		query += strings.Join(sortColumns, ", ")
+	}
+
+	// Add limit if provided
+	if opts.Limit > 0 {
+		query += fmt.Sprintf(" LIMIT %v", opts.Limit)
+	}
+
+	// Add offset if provided
+	if opts.Offset > 0 {
+		query += fmt.Sprintf(" OFFSET %v", opts.Offset)
+	}
+
+	// Setup do function
+	rows := []*RowT{}
+	do := func(r *spanner.Row) error {
+		row, err := t.readConverter(r)
+		if err != nil {
+			return err
+		}
+		rows = append(rows, row)
+		return nil
+	}
+
+	// Run query
+	it := txn.Query(ctx, spanner.NewStatement(query))
+	if err := it.Do(do); err != nil {
+		return nil, status.Errorf(codes.Internal, "querying table %s: %v", t.name, err)
 	}
 	return rows, nil
 }
