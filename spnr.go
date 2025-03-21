@@ -65,8 +65,8 @@ type Table[RowT any, KeyT any] struct {
 	db             *Db
 	name           string
 	colSet         map[string]bool
-	readConverter  func(r *spanner.Row) (*RowT, error)
-	writeConverter func(row *RowT) (map[string]any, error)
+	readConverter  func(r *spanner.Row) (RowT, error)
+	writeConverter func(row RowT) (map[string]any, error)
 	keyConverter   func(key KeyT) spanner.Key
 }
 
@@ -75,7 +75,7 @@ type Table[RowT any, KeyT any] struct {
 //   - table: The table name
 //   - columns: All the columns in the table including the key(s)
 //   - rowConverter: A function that takes in a spanner row and returns the generic type of this client
-func NewTableClient[RowT any, KeyT any](db *Db, table string, columns []string, keyConverter func(key KeyT) spanner.Key, readConverter func(r *spanner.Row) (*RowT, error), writeConverter func(row *RowT) (map[string]any, error)) (*Table[RowT, KeyT], error) {
+func NewTableClient[RowT any, KeyT any](db *Db, table string, columns []string, keyConverter func(key KeyT) spanner.Key, readConverter func(r *spanner.Row) (RowT, error), writeConverter func(row RowT) (map[string]any, error)) (*Table[RowT, KeyT], error) {
 	if db == nil {
 		return nil, errors.New("db is nil")
 	}
@@ -119,7 +119,7 @@ func (d *Db) Mutate(ctx context.Context, txn WriteTxn, mutations ...*spanner.Mut
 // Reads the specified row.
 // If no txn given, a ReadOnly txn is created. Its closed after returning the result.
 // If cols not specified, all columns are read.
-func (t *Table[RowT, KeyT]) Read(ctx context.Context, txn ReadTxn, key KeyT, cols ...string) (*RowT, error) {
+func (t *Table[RowT, KeyT]) Read(ctx context.Context, txn ReadTxn, key KeyT, cols ...string) (RowT, error) {
 	if txn == nil {
 		tempTxn := t.db.Client.ReadOnlyTransaction()
 		defer tempTxn.Close()
@@ -132,12 +132,13 @@ func (t *Table[RowT, KeyT]) Read(ctx context.Context, txn ReadTxn, key KeyT, col
 		}
 	}
 
+	var nilRow RowT
 	row, err := txn.ReadRow(ctx, t.name, t.keyConverter(key), cols)
 	if err != nil {
 		if errors.Is(err, spanner.ErrRowNotFound) {
-			return nil, status.Errorf(codes.NotFound, "%v not found", key)
+			return nilRow, status.Errorf(codes.NotFound, "%v not found", key)
 		} else {
-			return nil, status.Errorf(codes.Internal, "reading spanner row: %v", err)
+			return nilRow, status.Errorf(codes.Internal, "reading spanner row: %v", err)
 		}
 	}
 	return t.readConverter(row)
@@ -146,7 +147,7 @@ func (t *Table[RowT, KeyT]) Read(ctx context.Context, txn ReadTxn, key KeyT, col
 // Reads the specified rows. Does not fail if a row is not found.
 // If no txn given, a ReadOnly txn is created. Its closed after returning the result.
 // If cols not specified, all columns are read.
-func (t *Table[RowT, KeyT]) BatchRead(ctx context.Context, txn ReadTxn, keys []KeyT, cols ...string) ([]*RowT, error) {
+func (t *Table[RowT, KeyT]) BatchRead(ctx context.Context, txn ReadTxn, keys []KeyT, cols ...string) ([]RowT, error) {
 	if txn == nil {
 		tempTxn := t.db.Client.ReadOnlyTransaction()
 		defer tempTxn.Close()
@@ -159,7 +160,7 @@ func (t *Table[RowT, KeyT]) BatchRead(ctx context.Context, txn ReadTxn, keys []K
 		}
 	}
 
-	rows := []*RowT{}
+	rows := []RowT{}
 	do := func(r *spanner.Row) error {
 		row, err := t.readConverter(r)
 		if err != nil {
@@ -185,7 +186,7 @@ func (t *Table[RowT, KeyT]) BatchRead(ctx context.Context, txn ReadTxn, keys []K
 //   - ctx: context
 //   - txn: optional spanner ReadWrite txn; if none given, one is created and also closed after the create
 //   - row: the new row's data
-func (t *Table[RowT, KeyT]) Create(ctx context.Context, txn WriteTxn, row *RowT) error {
+func (t *Table[RowT, KeyT]) Create(ctx context.Context, txn WriteTxn, row RowT) error {
 	// convert row to map and validate
 	m, err := t.writeConverter(row)
 	if err != nil {
@@ -218,7 +219,7 @@ func (t *Table[RowT, KeyT]) Create(ctx context.Context, txn WriteTxn, row *RowT)
 //   - txn: optional spanner ReadWrite txn; if none given, one is created and also closed after the update
 //   - row: the existing row's data
 //   - cols: optional list of columns to limit the update to.
-func (t *Table[RowT, KeyT]) Update(ctx context.Context, txn WriteTxn, row *RowT, cols ...string) error {
+func (t *Table[RowT, KeyT]) Update(ctx context.Context, txn WriteTxn, row RowT, cols ...string) error {
 	// validate cols if any and build map
 	colSet := map[string]bool{}
 	if len(cols) > 0 {
@@ -312,7 +313,7 @@ type QueryOpts struct {
 
 // Queries the rows in the table using the parameters specifed in opts.
 // Creates a new ReadOnly txn if none given.
-func (t *Table[RowT, KeyT]) Query(ctx context.Context, txn ReadTxn, opts *QueryOpts) ([]*RowT, error) {
+func (t *Table[RowT, KeyT]) Query(ctx context.Context, txn ReadTxn, opts *QueryOpts) ([]RowT, error) {
 	if opts == nil {
 		opts = &QueryOpts{}
 	}
@@ -364,7 +365,7 @@ func (t *Table[RowT, KeyT]) Query(ctx context.Context, txn ReadTxn, opts *QueryO
 	}
 
 	// Setup do function
-	rows := []*RowT{}
+	rows := []RowT{}
 	do := func(r *spanner.Row) error {
 		row, err := t.readConverter(r)
 		if err != nil {

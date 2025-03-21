@@ -22,7 +22,7 @@ func TestCreateTestTable(t *testing.T) {
 	defer adminClient.Close()
 
 	op, err := adminClient.UpdateDatabaseDdl(ctx, &adminpb.UpdateDatabaseDdlRequest{
-		Database: "projects/local/instances/test/databases/dev",
+		Database: "projects/local/instances/test-instance/databases/dev",
 		Statements: []string{
 			`CREATE TABLE Users (
 				id STRING(100),
@@ -46,12 +46,12 @@ type User struct {
 }
 
 var Db *spnr.Db
-var UserTbl *spnr.Table[User, string]
+var UserTbl *spnr.Table[*User, string]
 var ctx = context.Background()
 
 func init() {
 	var err error
-	Db, err = spnr.NewDbClient(ctx, "projects/local/instances/test/databases/dev", "somerole")
+	Db, err = spnr.NewDbClient(ctx, "projects/local/instances/test-instance/databases/dev", "somerole")
 	if err != nil {
 		panic(err)
 	}
