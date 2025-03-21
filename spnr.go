@@ -62,7 +62,7 @@ func NewDbClient(ctx context.Context, database, role string) (*Db, error) {
 
 // A table.
 type Table[RowT any, KeyT any] struct {
-	db             *Db
+	Db             *Db
 	name           string
 	colSet         map[string]bool
 	readConverter  func(r *spanner.Row) (RowT, error)
@@ -93,7 +93,7 @@ func NewTableClient[RowT any, KeyT any](db *Db, table string, columns []string, 
 		colSet[col] = true
 	}
 	return &Table[RowT, KeyT]{
-		db:             db,
+		Db:             db,
 		name:           table,
 		colSet:         colSet,
 		keyConverter:   keyConverter,
@@ -116,12 +116,33 @@ func (d *Db) Mutate(ctx context.Context, txn WriteTxn, mutations ...*spanner.Mut
 	return err
 }
 
+// Returns a read-only spanner transaction to read multiple rows at the exact same point in time.
+func (d *Db) ReadOnlyTxn() *spanner.ReadOnlyTransaction {
+	return d.Client.ReadOnlyTransaction()
+}
+
+// Executes a read-write transaction, with retries as necessary.
+//
+// The function f will be called one or more times. It must not maintain any state between calls.
+//
+// If the transaction cannot be committed or if f returns an ABORTED error, ReadWriteTransaction will call f again. It will continue to call f until the transaction can be committed or the Context times out or is cancelled. If f returns an error other than ABORTED, ReadWriteTransaction will abort the transaction and return the error.
+//
+// To limit the number of retries, set a deadline on the Context rather than using a fixed limit on the number of attempts. ReadWriteTransaction will retry as needed until that deadline is met.
+//
+// See https://godoc.org/cloud.google.com/go/spanner#ReadWriteTransaction for more details.
+func (d *Db) ReadWriteTxn(ctx context.Context, f func(context.Context, *spanner.ReadWriteTransaction) error) error {
+	if _, err := d.Client.ReadWriteTransaction(ctx, f); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Reads the specified row.
 // If no txn given, a ReadOnly txn is created. Its closed after returning the result.
 // If cols not specified, all columns are read.
 func (t *Table[RowT, KeyT]) Read(ctx context.Context, txn ReadTxn, key KeyT, cols ...string) (RowT, error) {
 	if txn == nil {
-		tempTxn := t.db.Client.ReadOnlyTransaction()
+		tempTxn := t.Db.Client.ReadOnlyTransaction()
 		defer tempTxn.Close()
 		txn = tempTxn
 	}
@@ -149,7 +170,7 @@ func (t *Table[RowT, KeyT]) Read(ctx context.Context, txn ReadTxn, key KeyT, col
 // If cols not specified, all columns are read.
 func (t *Table[RowT, KeyT]) BatchRead(ctx context.Context, txn ReadTxn, keys []KeyT, cols ...string) ([]RowT, error) {
 	if txn == nil {
-		tempTxn := t.db.Client.ReadOnlyTransaction()
+		tempTxn := t.Db.Client.ReadOnlyTransaction()
 		defer tempTxn.Close()
 		txn = tempTxn
 	}
@@ -208,7 +229,7 @@ func (t *Table[RowT, KeyT]) Create(ctx context.Context, txn WriteTxn, row RowT) 
 
 	// run insert mutation
 	insertMutation := spanner.Insert(t.name, columns, values)
-	if err := t.db.Mutate(ctx, txn, insertMutation); err != nil {
+	if err := t.Db.Mutate(ctx, txn, insertMutation); err != nil {
 		return status.Errorf(codes.Internal, "creating spanner row: %v", err)
 	}
 	return nil
@@ -256,7 +277,7 @@ func (t *Table[RowT, KeyT]) Update(ctx context.Context, txn WriteTxn, row RowT, 
 
 	// run update mutation
 	updateMutation := spanner.Update(t.name, columns, values)
-	if err := t.db.Mutate(ctx, txn, updateMutation); err != nil {
+	if err := t.Db.Mutate(ctx, txn, updateMutation); err != nil {
 		return status.Errorf(codes.Internal, "updating spanner row: %v", err)
 	}
 	return nil
@@ -267,7 +288,7 @@ func (t *Table[RowT, KeyT]) Update(ctx context.Context, txn WriteTxn, row RowT, 
 func (t *Table[RowT, KeyT]) Delete(ctx context.Context, txn WriteTxn, key KeyT) error {
 	spannerKey := t.keyConverter(key)
 	deleteMutation := spanner.Delete(t.name, spanner.KeySetFromKeys(spannerKey))
-	if err := t.db.Mutate(ctx, txn, deleteMutation); err != nil {
+	if err := t.Db.Mutate(ctx, txn, deleteMutation); err != nil {
 		return status.Errorf(codes.Internal, "deleting spanner rows: %v", err)
 	}
 	return nil
@@ -286,7 +307,7 @@ func (t *Table[RowT, KeyT]) BatchDelete(ctx context.Context, txn WriteTxn, keys 
 	}
 
 	deleteMutation := spanner.Delete(t.name, spanner.KeySetFromKeys(spannerKeys...))
-	if err := t.db.Mutate(ctx, txn, deleteMutation); err != nil {
+	if err := t.Db.Mutate(ctx, txn, deleteMutation); err != nil {
 		return status.Errorf(codes.Internal, "deleting spanner rows: %v", err)
 	}
 	return nil
@@ -320,7 +341,7 @@ func (t *Table[RowT, KeyT]) Query(ctx context.Context, txn ReadTxn, opts *QueryO
 
 	// create txn if none given
 	if txn == nil {
-		t := t.db.Client.ReadOnlyTransaction()
+		t := t.Db.Client.ReadOnlyTransaction()
 		defer t.Close()
 		txn = t
 	}
