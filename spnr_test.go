@@ -2,6 +2,7 @@ package spnr_test
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/acudac-com/spnr-go"
@@ -13,6 +14,8 @@ import (
 	adminpb "cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 )
 
+var DbName = os.Getenv("SPANNER_DATABASE")
+
 func TestCreateTestTable(t *testing.T) {
 	ctx := context.Background()
 	adminClient, err := database.NewDatabaseAdminClient(ctx)
@@ -22,13 +25,13 @@ func TestCreateTestTable(t *testing.T) {
 	defer adminClient.Close()
 
 	op, err := adminClient.UpdateDatabaseDdl(ctx, &adminpb.UpdateDatabaseDdlRequest{
-		Database: "projects/local/instances/test-instance/databases/dev",
+		Database: DbName,
 		Statements: []string{
-			`CREATE TABLE Users (
-				id STRING(100),
-				name STRING(MAX),
+			`CREATE TABLE spnr_go_Example (
+				key STRING(100),
+				name STRING(100),
 				age INT64,
-			) PRIMARY KEY (id)`,
+			) PRIMARY KEY (key)`,
 		},
 	})
 	if err != nil {
@@ -39,31 +42,31 @@ func TestCreateTestTable(t *testing.T) {
 	}
 }
 
-type User struct {
-	id   string
+type Example struct {
+	key  string
 	name string
 	age  int64
 }
 
 var Db *spnr.Db
-var UserTbl *spnr.Table[*User, string]
+var ExampleTbl *spnr.Table[*Example, string]
 var ctx = context.Background()
 
 func init() {
 	var err error
-	Db, err = spnr.NewDbClient(ctx, "projects/local/instances/test-instance/databases/dev", "somerole")
+	Db, err = spnr.NewDbClient(ctx, DbName, "")
 	if err != nil {
 		panic(err)
 	}
 	keyConverter := func(id string) spanner.Key {
 		return spanner.Key{id}
 	}
-	readConverter := func(row *spanner.Row) (*User, error) {
-		user := &User{}
+	readConverter := func(row *spanner.Row) (*Example, error) {
+		user := &Example{}
 		for i, col := range row.ColumnNames() {
 			switch col {
-			case "id":
-				row.Column(i, &user.id)
+			case "key":
+				row.Column(i, &user.key)
 			case "name":
 				row.Column(i, &user.name)
 			case "age":
@@ -73,49 +76,49 @@ func init() {
 		return user, nil
 	}
 
-	writeConverter := func(user *User) (map[string]any, error) {
+	writeConverter := func(user *Example) (map[string]any, error) {
 		return map[string]any{
-			"id":   user.id,
+			"key":  user.key,
 			"name": user.name,
 			"age":  user.age,
 		}, nil
 	}
-	UserTbl, err = spnr.NewTableClient(Db, "Users", []string{"id", "name", "age"}, keyConverter, readConverter, writeConverter)
+	ExampleTbl, err = spnr.NewTableClient(Db, "spnr_go_Example", []string{"key", "name", "age"}, keyConverter, readConverter, writeConverter)
 	if err != nil {
-		alog.Warnf(ctx, "Could not create UserTbl: %v. Remember to run TestCreateTestTable", err)
+		alog.Warnf(ctx, "Could not create ExampleTbl: %v. Remember to run TestCreateTestTable", err)
 	}
 }
 
 func TestCreate(t *testing.T) {
-	user := &User{
-		id:   "asdf",
+	user := &Example{
+		key:  "asdf",
 		name: "Daniel",
 		age:  27,
 	}
-	if err := UserTbl.Create(ctx, nil, user); err != nil {
+	if err := ExampleTbl.Create(ctx, nil, user); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestUpdate(t *testing.T) {
-	user := &User{
-		id:   "asdf",
+	user := &Example{
+		key:  "asdf",
 		name: "Daniel van Niekerk",
 		age:  27,
 	}
-	if err := UserTbl.Update(ctx, nil, user); err != nil {
+	if err := ExampleTbl.Update(ctx, nil, user); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestDelete(t *testing.T) {
-	if err := UserTbl.Delete(ctx, nil, "asdf"); err != nil {
+	if err := ExampleTbl.Delete(ctx, nil, "asdf"); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestRead(t *testing.T) {
-	user, err := UserTbl.Read(ctx, nil, "asdf")
+	user, err := ExampleTbl.Read(ctx, nil, "asdf")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +126,7 @@ func TestRead(t *testing.T) {
 }
 
 func TestBatchRead(t *testing.T) {
-	users, err := UserTbl.BatchRead(ctx, nil, []string{"asdf", "qwer"})
+	users, err := ExampleTbl.BatchRead(ctx, nil, []string{"asdf", "qwer"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +136,7 @@ func TestBatchRead(t *testing.T) {
 }
 
 func TestQuery(t *testing.T) {
-	users, err := UserTbl.Query(ctx, nil, &spnr.QueryOpts{
+	users, err := ExampleTbl.Query(ctx, nil, &spnr.QueryOpts{
 		Where: "age < 30",
 	})
 	if err != nil {
