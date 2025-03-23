@@ -15,6 +15,7 @@ import (
 )
 
 var DbName = os.Getenv("SPANNER_DATABASE")
+var DbRole = os.Getenv("SPANNER_ROLE")
 
 func TestCreateTestTable(t *testing.T) {
 	ctx := context.Background()
@@ -27,7 +28,7 @@ func TestCreateTestTable(t *testing.T) {
 	op, err := adminClient.UpdateDatabaseDdl(ctx, &adminpb.UpdateDatabaseDdlRequest{
 		Database: DbName,
 		Statements: []string{
-			`CREATE TABLE spnr_go_Example (
+			`CREATE TABLE spnr_go_dev_Example (
 				key STRING(100),
 				name STRING(100),
 				age INT64,
@@ -54,7 +55,7 @@ var ctx = context.Background()
 
 func init() {
 	var err error
-	Db, err = spnr.NewDbClient(ctx, DbName, "")
+	Db, err = spnr.NewDbClient(ctx, DbName, DbRole)
 	if err != nil {
 		panic(err)
 	}
@@ -83,7 +84,7 @@ func init() {
 			"age":  user.age,
 		}, nil
 	}
-	ExampleTbl, err = spnr.NewTableClient(Db, "spnr_go_Example", []string{"key", "name", "age"}, keyConverter, readConverter, writeConverter)
+	ExampleTbl, err = spnr.NewTableClient(Db, "spnr_go_dev_Example", []string{"key", "name", "age"}, keyConverter, readConverter, writeConverter)
 	if err != nil {
 		alog.Warnf(ctx, "Could not create ExampleTbl: %v. Remember to run TestCreateTestTable", err)
 	}
